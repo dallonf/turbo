@@ -70,5 +70,7 @@ interface TurbopackBaseContext {
   w: LoadWebAssembly;
   u: LoadWebAssemblyModule;
   g: typeof globalThis;
+  p: ResolveAbsolutePath;
+  U: RelativeURL;
   __dirname: string;
 }

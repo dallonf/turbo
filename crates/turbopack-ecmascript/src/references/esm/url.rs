@@ -9,7 +9,7 @@ use turbopack_core::{
         ChunkItemExt, ChunkableModule, ChunkableModuleReference, ChunkingType, ChunkingTypeOption,
     },
     environment::Rendering,
-    issue::IssueSource,
+    issue::{code_gen::CodeGenerationIssue, IssueExt, IssueSeverity, IssueSource, StyledString},
     reference::ModuleReference,
     reference_type::UrlReferenceSubType,
     resolve::{origin::ResolveOrigin, parse::Request, ModuleResolveResult},
@@ -135,7 +135,8 @@ impl CodeGenerateable for UrlAssetReference {
     ┌───────────────────────────────┬─────────────────────────────────────────────────────────────────────────┬────────────────────────────────────────────────┬───────────────────────┐
     │  UrlRewriteBehavior\RefAsset  │                         ReferencedAsset::Some()                         │           ReferencedAsset::External            │ ReferencedAsset::None │
     ├───────────────────────────────┼─────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────┼───────────────────────┤
-    │ Relative                      │ __turbopack_relative_url__(__turbopack_require__(urlId))                │ __turbopack_relative_url__(url)                │ new URL(url, base)    │
+    │ Relative(RenderingClient::*)  │ __turbopack_relative_url__(__turbopack_require__(urlId),                | __turbopack_relative_url__(url)                | new URL(url, base)    |
+    |                               |                            location.origin|server_addr)                 │                                                │                       │
     │ Full(RenderingClient::Client) │ new URL(__turbopack_require__(urlId), location.origin)                  │ new URL(url, location.origin)                  │ new URL(url, base)    │
     │ Full(RenderingClient::..)     │ new URL(__turbopack_resolve_module_id_path__(urlId))                    │ new URL(url, base)                             │ new URL(url, base)    │
     │ None                          │ new URL(url, base)                                                      │ new URL(url, base)                             │ new URL(url, base)    │
@@ -160,7 +161,7 @@ impl CodeGenerateable for UrlAssetReference {
                 // static asset path. for the `new URL()` call, replace it into
                 // pseudo url object `__turbopack_relative_url__`
                 // which is injected by turbopack's runtime to resolve into the relative path
-                // omitting the base.
+                // with the rendering-context aware base.
                 match &*referenced_asset {
                     ReferencedAsset::Some(asset) => {
                         // We rewrite the first `new URL()` arguments to be a require() of the chunk
@@ -170,26 +171,71 @@ impl CodeGenerateable for UrlAssetReference {
                             .id()
                             .await?;
 
-                        visitors.push(create_visitor!(ast_path, visit_mut_expr(new_expr: &mut Expr) {
-                            if let Expr::New(NewExpr { args: Some(args), callee, .. }) = new_expr {
-                                *callee = Box::new(quote!("__turbopack_relative_url__" as Expr));
-                                if let Some(ExprOrSpread { box expr, spread: None }) = args.get_mut(0) {
-                                    *expr = quote!(
-                                        "__turbopack_require__($id)" as Expr,
-                                        id: Expr = module_id_to_lit(&id),
-                                    );
+                        let rewrite_url_base = match &*this.rendering.await? {
+                            Rendering::Client => Some(quote!("location.origin" as Expr)),
+                            Rendering::Server(server_addr) => {
+                                let location = server_addr.await?.to_string()?;
+                                Some(location.into())
+                            }
+                            Rendering::None => {
+                                CodeGenerationIssue {
+                                    severity: IssueSeverity::Error.into(),
+                                    title: Vc::cell(
+                                        "new URL(…) not implemented for this environment"
+                                            .to_string(),
+                                    ),
+                                    message: StyledString::Text(
+                                        "new URL(…) is only currently supported for rendering \
+                                         environments like Client-Side or Server-Side Rendering."
+                                            .to_string(),
+                                    )
+                                    .cell(),
+                                    path: this.origin.origin_path(),
                                 }
+                                .cell()
+                                .emit();
+                                None
+                            }
+                        };
+
+                        visitors.push(create_visitor!(ast_path, visit_mut_expr(new_expr: &mut Expr) {
+                            let should_rewrite_to_relative = if let Expr::New(NewExpr { args: Some(args), .. }) = new_expr {
+                                if let Some(ExprOrSpread { .. }) = args.get(0) {
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+
+                            if should_rewrite_to_relative {
+                                *new_expr = quote!(
+                                    "new __turbopack_relative_url__(__turbopack_require__($id), $base)" as Expr,
+                                    id: Expr = module_id_to_lit(&id),
+                                    base: Expr = rewrite_url_base.clone().unwrap_or_else(|| "undefined".into()),
+                                );
                             }
                         }));
                     }
                     ReferencedAsset::OriginalReferenceTypeExternal(request) => {
                         let request = request.to_string();
                         visitors.push(create_visitor!(ast_path, visit_mut_expr(new_expr: &mut Expr) {
-                            if let Expr::New(NewExpr { args: Some(args), callee, .. }) = new_expr {
-                                *callee = Box::new(quote!("__turbopack_relative_url__" as Expr));
-                                if let Some(ExprOrSpread { box expr, spread: None }) = args.get_mut(0) {
-                                    *expr = request.as_str().into()
+                            let should_rewrite_to_relative = if let Expr::New(NewExpr { args: Some(args), .. }) = new_expr {
+                                if let Some(ExprOrSpread { .. }) = args.get(0) {
+                                    true
+                                } else {
+                                    false
                                 }
+                            } else {
+                                false
+                            };
+
+                            if should_rewrite_to_relative {
+                                *new_expr = quote!(
+                                    "new __turbopack_relative_url__($id)" as Expr,
+                                    id: Expr = request.as_str().into(),
+                                );
                             }
                         }));
                     }
@@ -223,7 +269,7 @@ impl CodeGenerateable for UrlAssetReference {
                         // If there's a rewrite to the base url, then the current rendering
                         // environment should able to resolve the asset path
                         // (asset_url) from the base. Wrap the module id
-                        // with __turbopack_require_ which returns the asset_url.
+                        // with __turbopack_require__ which returns the asset_url.
                         //
                         // Otherwise, the envioronment should provide an absolute path to the actual
                         // output asset; delegate those calculation to the
